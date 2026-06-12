@@ -38,6 +38,8 @@ from collections import OrderedDict
 import shutil
 import venv
 import zipfile
+import gzip
+import platform
 from pathlib import Path
 from flask import Flask, request, jsonify
 import psutil
@@ -97,6 +99,22 @@ app.config['JSON_SORT_KEYS'] = False
 # API Configuration
 API_PORT = int(os.environ.get('HEXSTRIKE_PORT', 8888))
 API_HOST = os.environ.get('HEXSTRIKE_HOST', '127.0.0.1')
+
+# Tor / dark-web OSINT transport configuration
+# All deep/dark-web OSINT fetches route through this SOCKS5 proxy (Tor daemon).
+# socks5h:// => hostname (incl. .onion) resolved by the proxy, not locally (no DNS leak).
+TOR_SOCKS_PROXY = os.environ.get('HEXSTRIKE_TOR_PROXY', 'socks5h://127.0.0.1:9050')
+TOR_CONTROL_HOST = os.environ.get('HEXSTRIKE_TOR_CONTROL_HOST', '127.0.0.1')
+TOR_CONTROL_PORT = int(os.environ.get('HEXSTRIKE_TOR_CONTROL_PORT', 9051))
+TOR_CONTROL_PASSWORD = os.environ.get('HEXSTRIKE_TOR_CONTROL_PASSWORD', '')
+
+# Wordlist storage — OS-aware. Override with HEXSTRIKE_WORDLIST_DIR.
+# Kali ships SecLists under /usr/share/seclists; Windows has no default.
+if platform.system() == "Windows":
+    _DEFAULT_WORDLIST_DIR = str(Path(os.environ.get("USERPROFILE", str(Path.home()))) / "wordlists")
+else:
+    _DEFAULT_WORDLIST_DIR = "/opt/wordlists"
+WORDLIST_DIR = os.environ.get('HEXSTRIKE_WORDLIST_DIR', _DEFAULT_WORDLIST_DIR)
 
 # ============================================================================
 # MODERN VISUAL ENGINE (v2.0 ENHANCEMENT)
@@ -9020,6 +9038,14 @@ file_manager = FileOperationsManager()
 
 # API Routes
 
+# Module-level cache for the health tool-detection scan. Scanning ~120 tools via
+# `which` on every /health call takes ~5s+ (esp. on Windows where `which` is absent,
+# so results never hit the command cache). The MCP client polls /health frequently and
+# uses a short read timeout, so we memoize the scan with a TTL.
+_HEALTH_TOOL_CACHE = {"timestamp": 0.0, "tools_status": None}
+_HEALTH_TOOL_CACHE_TTL = 60.0  # seconds
+
+
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint with comprehensive tool detection"""
@@ -9093,14 +9119,21 @@ def health_check():
         password_tools + binary_tools + forensics_tools + cloud_tools +
         osint_tools + exploitation_tools + api_tools + wireless_tools + additional_tools
     )
-    tools_status = {}
-
-    for tool in all_tools:
-        try:
-            result = execute_command(f"which {tool}", use_cache=True)
-            tools_status[tool] = result["success"]
-        except:
-            tools_status[tool] = False
+    # Serve cached scan if still fresh — avoids re-running ~120 `which` probes per call.
+    now = time.time()
+    if (_HEALTH_TOOL_CACHE["tools_status"] is not None and
+            now - _HEALTH_TOOL_CACHE["timestamp"] < _HEALTH_TOOL_CACHE_TTL):
+        tools_status = _HEALTH_TOOL_CACHE["tools_status"]
+    else:
+        tools_status = {}
+        for tool in all_tools:
+            try:
+                result = execute_command(f"which {tool}", use_cache=True)
+                tools_status[tool] = result["success"]
+            except:
+                tools_status[tool] = False
+        _HEALTH_TOOL_CACHE["tools_status"] = tools_status
+        _HEALTH_TOOL_CACHE["timestamp"] = now
 
     all_essential_tools_available = all(tools_status[tool] for tool in essential_tools)
 
@@ -17249,6 +17282,1179 @@ def get_alternative_tools():
     except Exception as e:
         logger.error(f"Error getting alternative tools: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+# ============================================================================
+# CYBER RANGE / DOJO / WAR ROOM TRAINING FRAMEWORK (v9.0 ENHANCEMENT)
+# ============================================================================
+# Builds rich, structured training content for authorized pentest labs, CTF
+# dojos, and event war rooms. Everything below produces LEARNING workflows,
+# scenario blueprints, and detection/defense artifacts intended for isolated
+# lab ranges and authorized engagements only.
+# ============================================================================
+
+class TorClient:
+    """Routes deep/dark-web OSINT traffic through the Tor network via a local
+    SOCKS5 proxy. Uses socks5h:// so .onion + clearnet hostnames resolve through
+    the proxy (no local DNS leak). Authorized OSINT / threat-intel only.
+
+    Requires a running Tor daemon and PySocks (`pip install requests[socks]`).
+    Default proxy 127.0.0.1:9050. Optional control port (stem) for new circuits."""
+
+    def __init__(self, socks_proxy: str = TOR_SOCKS_PROXY,
+                 control_host: str = TOR_CONTROL_HOST,
+                 control_port: int = TOR_CONTROL_PORT,
+                 control_password: str = TOR_CONTROL_PASSWORD):
+        self.socks_proxy = socks_proxy
+        self.control_host = control_host
+        self.control_port = control_port
+        self.control_password = control_password
+        self.proxies = {"http": socks_proxy, "https": socks_proxy}
+        # Realistic, non-fingerprinting UA per Tor Browser guidance.
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0",
+            "Accept-Language": "en-US,en;q=0.5",
+        }
+
+    def status(self) -> Dict[str, Any]:
+        """Verify Tor connectivity through the SOCKS proxy. Reports exit IP and
+        whether the circuit is recognized by the Tor Project."""
+        try:
+            resp = requests.get(
+                "https://check.torproject.org/api/ip",
+                proxies=self.proxies, headers=self.headers, timeout=30,
+            )
+            data = resp.json()
+            return {
+                "connected": True,
+                "is_tor": data.get("IsTor", False),
+                "exit_ip": data.get("IP", "unknown"),
+                "socks_proxy": self.socks_proxy,
+            }
+        except Exception as e:
+            return {
+                "connected": False,
+                "error": str(e),
+                "socks_proxy": self.socks_proxy,
+                "hint": "Is the Tor daemon running and is PySocks installed (requests[socks])?",
+            }
+
+    def fetch(self, url: str, method: str = "GET", timeout: int = 60,
+              extra_headers: Optional[Dict[str, str]] = None,
+              data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Fetch a clearnet or .onion URL over Tor. Read-only collection helper."""
+        headers = dict(self.headers)
+        if extra_headers:
+            headers.update(extra_headers)
+        try:
+            resp = requests.request(
+                method.upper(), url, proxies=self.proxies, headers=headers,
+                data=data, timeout=timeout, allow_redirects=True,
+            )
+            body = resp.text
+            return {
+                "success": True,
+                "url": url,
+                "is_onion": url.lower().split("/")[2].endswith(".onion") if "//" in url else False,
+                "status_code": resp.status_code,
+                "final_url": resp.url,
+                "content_length": len(body),
+                "content": body[:200000],  # cap to protect model context
+                "truncated": len(body) > 200000,
+                "routed_through_tor": True,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "url": url,
+                "error": str(e),
+                "routed_through_tor": True,
+                "hint": "Verify Tor is up (/api/osint/tor-status) and the .onion is reachable.",
+            }
+
+    def new_identity(self) -> Dict[str, Any]:
+        """Request a fresh Tor circuit (new exit) via the control port. Optional —
+        needs stem and a configured control port/password."""
+        try:
+            from stem import Signal
+            from stem.control import Controller
+            with Controller.from_port(address=self.control_host, port=self.control_port) as controller:
+                if self.control_password:
+                    controller.authenticate(password=self.control_password)
+                else:
+                    controller.authenticate()
+                controller.signal(Signal.NEWNYM)
+            return {"success": True, "message": "New Tor circuit requested"}
+        except Exception as e:
+            return {"success": False, "error": str(e),
+                    "hint": "Needs `pip install stem` and ControlPort enabled in torrc."}
+
+
+# Global Tor transport for deep/dark-web OSINT
+tor_client = TorClient()
+
+
+# ============================================================================
+# OSINT SOURCE REGISTRY (default URL list — global + Brazil-specific)
+# ============================================================================
+# Curated, legitimate OSINT sources for authorized investigation/training.
+# Each entry: name, url, selectors it accepts, access tier, and legal note.
+# selectors: email | phone | name | id | username | domain | cpf | cnpj
+# access: free | api-key | paid | gated | official | tool
+# .onion entries are fetched via Tor (tor_client / /api/osint/tor-fetch).
+# ============================================================================
+
+OSINT_SOURCES = {
+    "global": {
+        "breach_credential": [
+            {"name": "Have I Been Pwned", "url": "https://haveibeenpwned.com/", "selectors": ["email"], "access": "free/api-key", "note": "breach membership for an email/domain"},
+            {"name": "DeHashed", "url": "https://dehashed.com/", "selectors": ["email", "phone", "name", "username", "id"], "access": "paid", "note": "indexed breach records — broad selector pivot"},
+            {"name": "Intelligence X", "url": "https://intelx.io/", "selectors": ["email", "phone", "domain", "name"], "access": "api-key", "note": "leaks, pastes, darknet selectors"},
+            {"name": "LeakCheck", "url": "https://leakcheck.io/", "selectors": ["email", "phone", "username"], "access": "paid", "note": "breach lookup by selector"},
+            {"name": "Snusbase", "url": "https://snusbase.com/", "selectors": ["email", "phone", "name", "username"], "access": "paid", "note": "fast breach search"},
+            {"name": "BreachDirectory", "url": "https://breachdirectory.org/", "selectors": ["email", "username"], "access": "free/api-key", "note": "free-tier breach check"},
+            {"name": "h8mail", "url": "https://github.com/khast3x/h8mail", "selectors": ["email"], "access": "tool", "note": "email -> breach pivot, chains many APIs"},
+        ],
+        "email": [
+            {"name": "Epieos", "url": "https://epieos.com/", "selectors": ["email", "phone"], "access": "free/paid", "note": "email/phone -> linked Google/account services"},
+            {"name": "holehe", "url": "https://github.com/megadose/holehe", "selectors": ["email"], "access": "tool", "note": "checks 120+ sites for account existence"},
+            {"name": "EmailRep", "url": "https://emailrep.io/", "selectors": ["email"], "access": "free/api-key", "note": "reputation + profile signals"},
+            {"name": "Hunter.io", "url": "https://hunter.io/", "selectors": ["domain", "email"], "access": "api-key", "note": "email pattern + verified addresses per domain"},
+        ],
+        "phone": [
+            {"name": "PhoneInfoga", "url": "https://github.com/sundowndev/phoneinfoga", "selectors": ["phone"], "access": "tool", "note": "phone footprint + carrier + OSINT scan"},
+            {"name": "NumVerify", "url": "https://numverify.com/", "selectors": ["phone"], "access": "api-key", "note": "validation, carrier, line type, country"},
+            {"name": "Truecaller", "url": "https://www.truecaller.com/", "selectors": ["phone"], "access": "gated", "note": "name <-> phone (login required)"},
+        ],
+        "name_identity": [
+            {"name": "ThatsThem", "url": "https://thatsthem.com/", "selectors": ["name", "phone", "email"], "access": "free", "note": "name -> address/phone (US-centric)"},
+            {"name": "Pipl-style aggregators", "url": "https://pipl.com/", "selectors": ["name", "email", "phone"], "access": "paid", "note": "identity resolution (enterprise)"},
+            {"name": "WhitePages / FastPeopleSearch", "url": "https://www.fastpeoplesearch.com/", "selectors": ["name", "phone"], "access": "free", "note": "US people search"},
+        ],
+        "username_social": [
+            {"name": "Sherlock", "url": "https://github.com/sherlock-project/sherlock", "selectors": ["username"], "access": "tool", "note": "hunt username across 400+ sites"},
+            {"name": "WhatsMyName", "url": "https://whatsmyname.app/", "selectors": ["username"], "access": "free", "note": "web username enumeration"},
+            {"name": "Maigret", "url": "https://github.com/soxoj/maigret", "selectors": ["username"], "access": "tool", "note": "username -> profiles + extracted PII"},
+        ],
+        "domain_infra": [
+            {"name": "crt.sh", "url": "https://crt.sh/", "selectors": ["domain"], "access": "free", "note": "certificate transparency hostnames"},
+            {"name": "SecurityTrails", "url": "https://securitytrails.com/", "selectors": ["domain"], "access": "api-key", "note": "DNS history, subdomains"},
+            {"name": "Shodan", "url": "https://www.shodan.io/", "selectors": ["domain"], "access": "api-key", "note": "exposed services + banners"},
+            {"name": "Censys", "url": "https://search.censys.io/", "selectors": ["domain"], "access": "api-key", "note": "internet asset search"},
+        ],
+        "search_engines": [
+            {"name": "Google Dorks", "url": "https://www.google.com/", "selectors": ["name", "email", "phone", "id"], "access": "free", "note": 'site:/filetype:/intext: operators'},
+            {"name": "Yandex", "url": "https://yandex.com/", "selectors": ["name"], "access": "free", "note": "strong reverse-image + non-EN coverage"},
+            {"name": "DuckDuckGo", "url": "https://duckduckgo.com/", "selectors": ["name", "email"], "access": "free", "note": "less personalized indexing"},
+        ],
+    },
+    "onion": {
+        "search_index": [
+            {"name": "Ahmia", "url": "https://ahmia.fi/", "onion": "juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion", "selectors": ["name", "email", "domain"], "access": "free", "note": "filtered onion search (clearnet mirror too)"},
+            {"name": "Torch", "url": "", "onion": "xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd.onion", "selectors": ["name", "domain"], "access": "free", "note": "long-running onion index"},
+            {"name": "dark.fail", "url": "https://dark.fail/", "onion": "darkfailenbsdla5mal2mxn2uz66od5vtzd5qozslagrfzachha3f3id.onion", "selectors": ["domain"], "access": "free", "note": "verified onion mirror directory"},
+        ],
+        "leak_monitoring": [
+            {"name": "Ransomware.live", "url": "https://www.ransomware.live/", "selectors": ["name", "domain"], "access": "free", "note": "aggregates ransomware leak sites (DLS) — defensive monitoring"},
+            {"name": "RansomWatch", "url": "https://ransomwatch.telemetry.ltd/", "selectors": ["name"], "access": "free", "note": "tracks DLS victim postings"},
+        ],
+        "paste": [
+            {"name": "psbdmp", "url": "https://psbdmp.ws/", "selectors": ["email", "domain"], "access": "free/api", "note": "deleted/archived paste search"},
+        ],
+    },
+    "brazil": {
+        "identity_cpf": [
+            {"name": "Receita Federal - Consulta CPF", "url": "https://servicos.receita.fazenda.gov.br/Servicos/CPF/ConsultaSituacao/ConsultaPublica.asp", "selectors": ["cpf"], "access": "official", "note": "official CPF status — requires CPF + birthdate + captcha. Validation only, not enrichment"},
+            {"name": "TSE - Consulta Situação Eleitoral", "url": "https://www.tse.jus.br/eleitor/situacao-eleitoral", "selectors": ["cpf", "name"], "access": "official", "note": "voter registration status (official)"},
+            {"name": "Portal da Transparência", "url": "https://portaltransparencia.gov.br/", "selectors": ["name", "cpf"], "access": "official", "note": "public servants, benefits, sanctions (partial CPF masked)"},
+            {"name": "Escavador", "url": "https://www.escavador.com/", "selectors": ["name", "cpf"], "access": "free/paid", "note": "name -> lawsuits, professional history, public records"},
+            {"name": "JusBrasil", "url": "https://www.jusbrasil.com.br/", "selectors": ["name", "cpf"], "access": "free/paid", "note": "legal records, processes mentioning a person"},
+        ],
+        "company_cnpj": [
+            {"name": "ReceitaWS", "url": "https://receitaws.com.br/", "selectors": ["cnpj"], "access": "free/api", "note": "CNPJ -> company registration data"},
+            {"name": "BrasilAPI CNPJ", "url": "https://brasilapi.com.br/docs#tag/CNPJ", "selectors": ["cnpj"], "access": "free-api", "note": "official-source CNPJ lookup"},
+            {"name": "CNPJ.biz / casadosdados", "url": "https://casadosdados.com.br/", "selectors": ["cnpj", "name"], "access": "free", "note": "company search + partners (sócios)"},
+        ],
+        "phone_br": [
+            {"name": "Tellows BR", "url": "https://www.tellows.com.br/", "selectors": ["phone"], "access": "free", "note": "caller reputation, spam reports (BR)"},
+            {"name": "Qual Número", "url": "https://www.qualnumero.com.br/", "selectors": ["phone"], "access": "free", "note": "carrier/region by DDD + number"},
+            {"name": "Anatel - operadora/portabilidade", "url": "https://www.anatel.gov.br/", "selectors": ["phone"], "access": "official", "note": "number portability / carrier reference"},
+        ],
+        "legal_court_br": [
+            {"name": "TJ e-SAJ (estaduais)", "url": "https://esaj.tjsp.jus.br/", "selectors": ["name", "cpf"], "access": "official", "note": "state court process consult by name/CPF"},
+            {"name": "PJe / CNJ", "url": "https://www.cnj.jus.br/", "selectors": ["name"], "access": "official", "note": "unified judicial process lookup"},
+        ],
+        "breach_context_br": [
+            {"name": "Intelligence X (BR leaks)", "url": "https://intelx.io/", "selectors": ["cpf", "email", "phone", "name"], "access": "api-key", "note": "indexes major BR leaks (e.g. 2021 mega-leak) — for breach-exposure assessment"},
+            {"name": "DeHashed (BR records)", "url": "https://dehashed.com/", "selectors": ["cpf", "email", "phone", "name"], "access": "paid", "note": "selector pivot across BR breach data"},
+        ],
+    },
+}
+
+# Brazil grey-market CPF-seller / Telegram dump bots are intentionally excluded:
+# many are illegal (LGPD/Lei 13.709) and feed criminal activity. Use official
+# sources above for validation, and licensed breach-intel APIs for exposure
+# assessment under proper authorization.
+
+
+# ============================================================================
+# WORDLIST MANAGER (OS-aware auto-setup: SecLists + friends)
+# ============================================================================
+# Detects the host OS (Kali / other Linux / Windows), resolves common wordlists
+# from native install paths, and can auto-download missing ones from official
+# GitHub/source URLs (free sources first). Used by CTF, dojo, war-room and
+# malware-lab workflows for directory/subdomain/password/LFI fuzzing.
+# ============================================================================
+
+WORDLIST_REGISTRY = {
+    "raft-large-directories": {
+        "category": "web-content", "use": "directory/file brute force (ffuf/gobuster)",
+        "seclists_path": "Discovery/Web-Content/raft-large-directories.txt",
+        "kali_paths": ["/usr/share/seclists/Discovery/Web-Content/raft-large-directories.txt"],
+        "url": "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-large-directories.txt",
+        "filename": "raft-large-directories.txt", "large": False,
+    },
+    "rockyou": {
+        "category": "passwords", "use": "password cracking / spraying (hashcat/john)",
+        "seclists_path": "Passwords/Leaked-Databases/rockyou.txt",
+        "kali_paths": ["/usr/share/wordlists/rockyou.txt", "/usr/share/wordlists/rockyou.txt.gz"],
+        "url": "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt",
+        "filename": "rockyou.txt", "large": True,  # ~133MB
+    },
+    "subdomains-top1million-110000": {
+        "category": "dns", "use": "subdomain brute force (ffuf/gobuster/puredns)",
+        "seclists_path": "Discovery/DNS/subdomains-top1million-110000.txt",
+        "kali_paths": ["/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt"],
+        "url": "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-110000.txt",
+        "filename": "subdomains-top1million-110000.txt", "large": False,
+    },
+    "n0kovo_subdomains": {
+        "category": "dns", "use": "high-signal subdomain brute force",
+        "seclists_path": None, "kali_paths": [],
+        "url": "https://raw.githubusercontent.com/n0kovo/n0kovo_subdomains/main/n0kovo_subdomains_small.txt",
+        "url_large": "https://raw.githubusercontent.com/n0kovo/n0kovo_subdomains/main/n0kovo_subdomains_huge.txt",
+        "filename": "n0kovo_subdomains_small.txt", "large": False,
+    },
+    "api-endpoints": {
+        "category": "web-content", "use": "API path discovery",
+        "seclists_path": "Discovery/Web-Content/api/api-endpoints.txt",
+        "kali_paths": ["/usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt"],
+        "url": "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/api/api-endpoints.txt",
+        "filename": "api-endpoints.txt", "large": False,
+    },
+    "LFI-Jhaddix": {
+        "category": "fuzzing", "use": "local file inclusion / path traversal fuzzing",
+        "seclists_path": "Fuzzing/LFI/LFI-Jhaddix.txt",
+        "kali_paths": ["/usr/share/seclists/Fuzzing/LFI/LFI-Jhaddix.txt"],
+        "url": "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/LFI/LFI-Jhaddix.txt",
+        "filename": "LFI-Jhaddix.txt", "large": False,
+    },
+    "crackstation": {
+        "category": "passwords", "use": "offline hash cracking (human-only list)",
+        "seclists_path": None, "kali_paths": [],
+        "url": "https://crackstation.net/files/crackstation-human-only.txt.gz",
+        "filename": "crackstation-human-only.txt", "large": True,  # ~684MB gz
+    },
+    "onelistforall": {
+        "category": "web-content", "use": "all-in-one content discovery (six2dez)",
+        "seclists_path": None, "kali_paths": [],
+        "url": "https://raw.githubusercontent.com/six2dez/OneListForAll/main/dist/onelistforallmicro.txt",
+        "url_large": "https://raw.githubusercontent.com/six2dez/OneListForAll/main/dist/onelistforall.txt",
+        "filename": "onelistforallmicro.txt", "large": False,
+    },
+}
+
+
+class WordlistManager:
+    """OS-aware wordlist resolver + downloader. Kali ships SecLists natively;
+    elsewhere we resolve from a base dir and can auto-download from source."""
+
+    SECLISTS_BASES = ["/usr/share/seclists", "/usr/share/wordlists/seclists"]
+
+    def __init__(self, base_dir: str = WORDLIST_DIR):
+        self.base_dir = Path(base_dir)
+        self.env = self.detect_environment()
+
+    def detect_environment(self) -> Dict[str, Any]:
+        """Identify OS / distro and locate any native SecLists install."""
+        system = platform.system()
+        info = {
+            "os": system, "release": platform.release(), "machine": platform.machine(),
+            "is_windows": system == "Windows", "is_kali": False, "distro": "",
+            "seclists_base": None, "wordlist_base": str(self.base_dir),
+        }
+        osrel = Path("/etc/os-release")
+        if osrel.exists():
+            try:
+                for line in osrel.read_text(errors="ignore").splitlines():
+                    if line.startswith("ID="):
+                        info["distro"] = line.split("=", 1)[1].strip().strip('"')
+                info["is_kali"] = info["distro"].lower() == "kali"
+            except Exception:
+                pass
+        for cand in self.SECLISTS_BASES + [str(self.base_dir / "SecLists"), str(self.base_dir / "seclists")]:
+            if Path(cand).is_dir():
+                info["seclists_base"] = cand
+                break
+        return info
+
+    def _candidates(self, name: str, entry: Dict[str, Any]) -> List[str]:
+        cands = list(entry.get("kali_paths", []))
+        sp = entry.get("seclists_path")
+        if sp and self.env.get("seclists_base"):
+            cands.append(str(Path(self.env["seclists_base"]) / sp))
+        cands.append(str(self.base_dir / entry.get("filename", name + ".txt")))
+        return cands
+
+    def resolve(self, name: str) -> Dict[str, Any]:
+        entry = WORDLIST_REGISTRY.get(name)
+        if not entry:
+            return {"name": name, "found": False, "error": "unknown wordlist"}
+        for c in self._candidates(name, entry):
+            if Path(c).exists():
+                return {"name": name, "found": True, "path": c, "source": "local", "category": entry["category"]}
+            if Path(c + ".gz").exists():
+                return {"name": name, "found": True, "path": c + ".gz", "source": "local-compressed",
+                        "note": "gunzip before use", "category": entry["category"]}
+        return {"name": name, "found": False, "download_url": entry.get("url"),
+                "large": entry.get("large", False), "category": entry["category"],
+                "suggested_path": str(self.base_dir / entry.get("filename", name + ".txt"))}
+
+    def download(self, name: str, allow_large: bool = False, use_large_variant: bool = False) -> Dict[str, Any]:
+        entry = WORDLIST_REGISTRY.get(name)
+        if not entry:
+            return {"name": name, "success": False, "error": "unknown wordlist"}
+        url = entry.get("url_large") if (use_large_variant and entry.get("url_large")) else entry.get("url")
+        if not url:
+            return {"name": name, "success": False, "error": "no download url"}
+        if entry.get("large") and not allow_large:
+            return {"name": name, "success": False, "skipped": True,
+                    "reason": "large file — pass allow_large=true to download", "download_url": url}
+        try:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            dest = self.base_dir / Path(url.split("?")[0]).name
+            with requests.get(url, stream=True, timeout=600) as r:
+                r.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if chunk:
+                            f.write(chunk)
+            final = dest
+            if dest.suffix == ".gz":
+                out = self.base_dir / dest.stem
+                with gzip.open(dest, "rb") as gf, open(out, "wb") as of:
+                    shutil.copyfileobj(gf, of)
+                final = out
+            return {"name": name, "success": True, "path": str(final), "bytes": final.stat().st_size, "source": url}
+        except Exception as e:
+            return {"name": name, "success": False, "error": str(e), "download_url": url}
+
+    def setup(self, names: Optional[List[str]] = None, download: bool = False,
+              allow_large: bool = False) -> Dict[str, Any]:
+        names = names or list(WORDLIST_REGISTRY.keys())
+        results = {}
+        for n in names:
+            r = self.resolve(n)
+            if not r.get("found") and download:
+                d = self.download(n, allow_large=allow_large)
+                if d.get("success"):
+                    r = {"name": n, "found": True, "path": d["path"], "source": "downloaded",
+                         "category": WORDLIST_REGISTRY[n]["category"]}
+                else:
+                    r["download_attempt"] = d
+            results[n] = r
+        return {"environment": self.env, "wordlists": results, "install_hint": self._install_hint()}
+
+    def _install_hint(self) -> str:
+        if self.env["is_kali"]:
+            return ("Kali: `sudo apt install -y seclists wordlists` ; "
+                    "`sudo gunzip -k /usr/share/wordlists/rockyou.txt.gz` (rockyou). "
+                    "CeWL/CrackStation/OneListForAll: download via /api/wordlists/setup?download=true.")
+        if self.env["is_windows"]:
+            return (f"Windows: `git clone https://github.com/danielmiessler/SecLists \"{self.base_dir}\\SecLists\"` "
+                    f"or POST /api/wordlists/setup with download=true to pull individual lists into {self.base_dir}.")
+        return (f"Linux: `git clone https://github.com/danielmiessler/SecLists {self.base_dir}/SecLists` "
+                f"or POST /api/wordlists/setup with download=true.")
+
+    def cewl_command(self, url: str, depth: int = 2, min_length: int = 5,
+                     output: str = "", extra: str = "") -> Dict[str, Any]:
+        """Build a CeWL command to generate a target-specific wordlist by crawling."""
+        out = output or str(self.base_dir / "cewl_custom.txt")
+        cmd = f"cewl -d {depth} -m {min_length} -w {out} {extra} {url}".replace("  ", " ").strip()
+        install = "Kali: `sudo apt install -y cewl` | other: `gem install cewl`"
+        return {"tool": "CeWL", "command": cmd, "output": out, "install": install,
+                "note": "Crawls the target to build a context-specific wordlist (great for password spraying)."}
+
+
+# Global wordlist manager (OS auto-detected at startup)
+wordlist_manager = WordlistManager()
+
+
+class CyberRangeLabManager:
+    """Generates detailed blueprints for pentest labs, OSINT investigations,
+    payload-development exercises, and offense+defense malware labs.
+
+    Output is structured workflow/scenario data (phases, objectives, tools,
+    learning notes, scoring, detection artifacts) — the same orchestration
+    style used across HexStrike. Intended for isolated cyber ranges, training
+    dojos, and event war rooms where explicit authorization exists."""
+
+    DIFFICULTY_TIERS = ["white-belt", "blue-belt", "purple-belt", "black-belt"]
+
+    def __init__(self):
+        # Canonical scenario catalog surfaced to dojo/war-room organizers.
+        self.lab_scenarios = {
+            "web-app-gauntlet": {
+                "focus": "web exploitation",
+                "vulns": ["sqli", "xss", "ssrf", "idor", "file-upload", "auth-bypass"],
+                "tier": "blue-belt",
+            },
+            "ad-deathmatch": {
+                "focus": "active directory",
+                "vulns": ["kerberoast", "asreproast", "acl-abuse", "delegation", "dcsync"],
+                "tier": "purple-belt",
+            },
+            "cloud-breakout": {
+                "focus": "cloud / container",
+                "vulns": ["ssrf-imds", "iam-priv-esc", "container-escape", "exposed-bucket"],
+                "tier": "purple-belt",
+            },
+            "binary-pit": {
+                "focus": "pwn / reversing",
+                "vulns": ["buffer-overflow", "format-string", "use-after-free", "rop"],
+                "tier": "black-belt",
+            },
+            "blue-team-siege": {
+                "focus": "defense / detection",
+                "vulns": ["detection-engineering", "ir", "threat-hunting", "yara-authoring"],
+                "tier": "blue-belt",
+            },
+        }
+
+    # ----------------------------------------------------------------------
+    # 1. PENTEST LAB DEVELOPMENT
+    # ----------------------------------------------------------------------
+    def build_pentest_lab(self, scenario: str = "web-app-gauntlet", tier: str = "",
+                          team_mode: str = "individual") -> Dict[str, Any]:
+        """Produce a full pentest-lab blueprint: topology, target build specs,
+        graduated objectives, hints, and war-room scoring."""
+        scenario_def = self.lab_scenarios.get(scenario, self.lab_scenarios["web-app-gauntlet"])
+        tier = tier or scenario_def["tier"]
+
+        blueprint = {
+            "scenario": scenario,
+            "focus": scenario_def["focus"],
+            "difficulty_tier": tier,
+            "team_mode": team_mode,
+            "network_topology": {
+                "segments": [
+                    {"name": "dmz", "cidr": "10.10.10.0/24", "hosts": ["web-edge", "reverse-proxy"]},
+                    {"name": "internal", "cidr": "10.10.20.0/24", "hosts": ["app-server", "db-server"]},
+                    {"name": "mgmt", "cidr": "10.10.99.0/24", "hosts": ["jump-host", "siem-collector"]},
+                ],
+                "isolation": "host-only / no egress to internet (range firewall enforced)",
+                "pivot_paths": ["dmz -> internal via app-server", "internal -> mgmt via stolen creds"],
+            },
+            "target_build_specs": self._target_specs_for(scenario_def["vulns"]),
+            "lab_phases": [
+                {"phase": "enumeration", "objective": "Map attack surface", "tools": ["nmap", "naabu", "httpx", "katana"],
+                 "deliverable": "host+service inventory", "points": 100},
+                {"phase": "foothold", "objective": "Achieve initial access", "tools": ["nuclei", "sqlmap", "ffuf", "burpsuite"],
+                 "deliverable": "first shell / valid creds", "points": 250},
+                {"phase": "privilege-escalation", "objective": "Escalate locally", "tools": ["linpeas", "winpeas", "GTFOBins"],
+                 "deliverable": "root/SYSTEM", "points": 250},
+                {"phase": "lateral-movement", "objective": "Pivot across segments", "tools": ["chisel", "ligolo-ng", "crackmapexec"],
+                 "deliverable": "second host owned", "points": 200},
+                {"phase": "objective-capture", "objective": "Reach crown-jewel flag", "tools": ["scenario-specific"],
+                 "deliverable": "final flag + report", "points": 200},
+            ],
+            "learning_objectives": [
+                f"Practice {scenario_def['focus']} methodology end-to-end",
+                "Chain low-severity findings into critical impact",
+                "Produce a war-room-grade engagement report with evidence",
+            ],
+            "graduated_hints": [
+                {"cost": 25, "hint": "Re-check service banners for version-specific CVEs"},
+                {"cost": 50, "hint": "An exposed parameter trusts user input without validation"},
+                {"cost": 75, "hint": "Reused credentials bridge the dmz->internal boundary"},
+            ],
+            "instructor_notes": [
+                "Snapshot all VMs before session; revert per-team on completion.",
+                "Range firewall must block outbound; verify before go-live.",
+                "Seed deliberate noise so blue-team dojo can practice detection.",
+            ],
+            "estimated_time_minutes": {"white-belt": 120, "blue-belt": 240, "purple-belt": 420, "black-belt": 600}.get(tier, 240),
+            "wordlists": self._wordlists_for_focus(scenario_def["focus"]),
+            "disclaimer": "Isolated lab range only. Deploy on host-only networks you own.",
+        }
+        if team_mode in ("red-vs-blue", "war-room"):
+            blueprint["war_room_scoring"] = self._war_room_scoring()
+        return blueprint
+
+    def _target_specs_for(self, vulns: List[str]) -> List[Dict[str, Any]]:
+        """Map each scenario vuln class to a deliberately-vulnerable target spec."""
+        catalog = {
+            "sqli": {"base_image": "php:8-apache", "weakness": "unparameterized query in /search",
+                     "flag_location": "users.secret column", "intended_tool": "sqlmap"},
+            "xss": {"base_image": "node:20-alpine", "weakness": "reflected name param, no output encoding",
+                    "flag_location": "admin session cookie", "intended_tool": "burpsuite"},
+            "ssrf": {"base_image": "python:3.12", "weakness": "url-fetch feature trusts user host",
+                     "flag_location": "cloud metadata / internal admin", "intended_tool": "ffuf+collaborator"},
+            "idor": {"base_image": "ruby:3.3", "weakness": "object id not authz-checked",
+                     "flag_location": "other tenant invoice", "intended_tool": "burpsuite"},
+            "file-upload": {"base_image": "php:8-apache", "weakness": "extension allowlist bypassable",
+                            "flag_location": "webshell RCE -> /root/flag", "intended_tool": "manual+wfuzz"},
+            "auth-bypass": {"base_image": "node:20-alpine", "weakness": "JWT alg:none accepted",
+                            "flag_location": "admin panel", "intended_tool": "jwt_tool"},
+            "kerberoast": {"base_image": "windows-server-ad", "weakness": "SPN account weak password",
+                           "flag_location": "service account hash", "intended_tool": "impacket-GetUserSPNs"},
+            "buffer-overflow": {"base_image": "ubuntu:22.04 (no-canary, no-PIE)", "weakness": "gets() in setuid binary",
+                                "flag_location": "/root/flag via ret2libc", "intended_tool": "pwntools+gdb-pwndbg"},
+        }
+        specs = []
+        for v in vulns:
+            spec = catalog.get(v, {"base_image": "ubuntu:22.04", "weakness": f"deliberate {v} weakness",
+                                   "flag_location": "scenario flag", "intended_tool": "operator choice"})
+            spec = {**spec, "vuln_class": v}
+            specs.append(spec)
+        return specs
+
+    def _war_room_scoring(self) -> Dict[str, Any]:
+        return {
+            "model": "attack/defense king-of-the-hill",
+            "red_team_points": {"first_blood": 500, "flag_capture": 250, "persistence_held_per_tick": 50},
+            "blue_team_points": {"detection_within_5min": 300, "containment": 250, "clean_eviction": 200,
+                                 "accurate_ioc_report": 150},
+            "tick_seconds": 300,
+            "tie_breakers": ["mean-time-to-detect", "report quality", "lowest collateral"],
+        }
+
+    def _wordlists_for_focus(self, focus: str) -> Dict[str, Any]:
+        """Resolve focus-appropriate wordlists (OS-aware) for the lab."""
+        focus_map = {
+            "web exploitation": ["raft-large-directories", "api-endpoints", "onelistforall", "LFI-Jhaddix"],
+            "active directory": ["rockyou", "subdomains-top1million-110000"],
+            "cloud / container": ["raft-large-directories", "api-endpoints", "subdomains-top1million-110000"],
+            "pwn / reversing": ["rockyou"],
+            "defense / detection": ["rockyou", "crackstation"],
+        }
+        names = focus_map.get(focus, ["raft-large-directories", "subdomains-top1million-110000", "rockyou"])
+        setup = wordlist_manager.setup(names=names, download=False)
+        return {
+            "os": setup["environment"]["os"],
+            "is_kali": setup["environment"]["is_kali"],
+            "resolved": setup["wordlists"],
+            "cewl_tip": "Generate a target-specific list with /api/wordlists/cewl for password spraying.",
+            "install_hint": setup["install_hint"],
+        }
+
+    # ----------------------------------------------------------------------
+    # 2. OSINT INVESTIGATION (SURFACE + DEEP/DARK WEB)
+    # ----------------------------------------------------------------------
+    def build_osint_investigation(self, target: str, depth: str = "surface",
+                                  investigation_type: str = "organization") -> Dict[str, Any]:
+        """Layered OSINT collection plan. depth = surface | deep | full.
+        Deep layers (paste/breach/dark-web) are gated behind OPSEC guidance and
+        are for authorized investigation/training only."""
+        plan = {
+            "target": target,
+            "investigation_type": investigation_type,
+            "depth": depth,
+            "layers": [],
+            "opsec": [
+                "Use a dedicated, attributable-isolated research VM (sock-puppet, VPN/Tor as scoped).",
+                "Never authenticate to target infra during passive OSINT.",
+                "Log every source with timestamp for chain-of-custody.",
+                "Stay within authorized scope; passive collection only unless engagement says otherwise.",
+            ],
+            "disclaimer": "Authorized investigation / training only. Respect law and platform ToS.",
+        }
+
+        # --- Surface layer (always included) ---
+        plan["layers"].append({
+            "layer": "surface-web",
+            "phases": [
+                {"name": "domain-infra", "tools": [
+                    {"tool": "whois", "purpose": "registrant + dates"},
+                    {"tool": "dnsrecon", "purpose": "records + zone walk"},
+                    {"tool": "amass", "purpose": "passive subdomain enum"},
+                    {"tool": "crt.sh / certificate_transparency", "purpose": "cert-derived hostnames"},
+                ]},
+                {"name": "search-footprint", "tools": [
+                    {"tool": "google-dorking", "purpose": "indexed sensitive files/paths"},
+                    {"tool": "wayback/gau", "purpose": "historical URLs + endpoints"},
+                    {"tool": "shodan / censys", "purpose": "exposed services + banners"},
+                ]},
+                {"name": "people-social", "tools": [
+                    {"tool": "theHarvester", "purpose": "emails, names, hosts"},
+                    {"tool": "sherlock", "purpose": "username across platforms"},
+                    {"tool": "linkedin/social_mapper", "purpose": "org chart + roles"},
+                ]},
+                {"name": "breach-exposure-surface", "tools": [
+                    {"tool": "haveibeenpwned", "purpose": "known breach membership"},
+                    {"tool": "hunter_io", "purpose": "email pattern + verified addresses"},
+                ]},
+            ],
+            "pivot_outputs": ["seed emails", "subdomains", "employee names", "tech stack"],
+        })
+
+        # --- Tor transport (all deep/dark fetches route through it) ---
+        if depth in ("deep", "full"):
+            plan["tor_transport"] = {
+                "enabled": True,
+                "socks_proxy": tor_client.socks_proxy,
+                "dns": "socks5h — hostnames (incl .onion) resolved by Tor, no local DNS leak",
+                "fetch_endpoint": "/api/osint/tor-fetch",
+                "status_endpoint": "/api/osint/tor-status",
+                "rotate_circuit": "/api/osint/tor-new-identity",
+                "rule": "ALL deep/dark-web OSINT fetches in this plan are routed through Tor.",
+            }
+
+        # --- Deep layer (depth in deep|full) ---
+        if depth in ("deep", "full"):
+            plan["layers"].append({
+                "layer": "deep-web",
+                "routed_through_tor": True,
+                "access_note": "Non-indexed but legal sources: paste sites, gated forums, doc repos, regulatory DBs.",
+                "phases": [
+                    {"name": "paste-and-leak-monitoring", "sources": [
+                        "pastebin/ghostbin scrapers (psbdmp)", "github/gitlab dorking for secrets (trufflehog, gitleaks)",
+                        "public S3/blob enumeration",
+                    ], "purpose": "leaked creds, keys, config"},
+                    {"name": "credential-intel", "sources": [
+                        "dehashed / breach-compilation lookups (authorized API)",
+                        "intelx.io selectors", "h8mail email->breach pivot",
+                    ], "purpose": "exposed credentials for the org's selectors"},
+                    {"name": "deep-document-intel", "sources": [
+                        "SEC/EDGAR, court records, procurement portals", "academic + patent DBs",
+                    ], "purpose": "business relationships, infra hints"},
+                ],
+            })
+
+        # --- Dark layer (depth == full) ---
+        if depth == "full":
+            plan["layers"].append({
+                "layer": "dark-web",
+                "routed_through_tor": True,
+                "access_note": "Tor/I2P sources. HIGH OPSEC. Authorized threat-intel/training only.",
+                "transport": {
+                    "gateway": f"Tor SOCKS5h proxy ({tor_client.socks_proxy})",
+                    "fetch_via": "/api/osint/tor-fetch  (POST {url})",
+                    "isolation": "run server in tails/whonix-style range VM for full traffic isolation",
+                    "rules": ["read-only collection", "no engagement with criminal services",
+                              "no purchases", "preserve evidence, report per IR policy"],
+                },
+                "phases": [
+                    {"name": "onion-discovery",
+                     "seed_sources": OSINT_SOURCES["onion"]["search_index"],
+                     "purpose": "locate mentions of target/selectors via onion search indexes"},
+                    {"name": "threat-actor-mentions",
+                     "seed_sources": OSINT_SOURCES["onion"]["leak_monitoring"],
+                     "purpose": "detect target data for sale / extortion (defensive DLS monitoring)"},
+                    {"name": "ioc-extraction", "sources": ["actor TTP write-ups", "paste-of-paste dumps"],
+                     "purpose": "feed defensive detection (pivots to malware-lab defense track)"},
+                ],
+            })
+
+        plan["correlation"] = {
+            "engine": "link selectors across layers (email <-> username <-> infra <-> breach record)",
+            "output_artifact": "entity-relationship graph + sourced findings table",
+            "handoff": "qualified findings feed pentest-lab scoping or blue-team detection rules",
+        }
+        plan["estimated_time_minutes"] = {"surface": 120, "deep": 300, "full": 540}.get(depth, 120)
+        return plan
+
+    # ----------------------------------------------------------------------
+    # 2b. SELECTOR INVESTIGATION (email / phone / name / id — global + Brazil)
+    # ----------------------------------------------------------------------
+    def build_selector_investigation(self, selector: str, selector_type: str = "email",
+                                     country: str = "global", depth: str = "surface") -> Dict[str, Any]:
+        """Given a single selector (email/phone/name/id/username/domain), build a
+        prioritized source-by-source lookup plan. country='br' adds Brazil sources
+        (CPF/CNPJ/court). depth='deep'|'full' adds Tor-routed onion sources.
+
+        Authorized investigation only. PII handling must follow GDPR/LGPD."""
+        selector_type = selector_type.lower()
+        # Brazilian national IDs map to cpf/cnpj selector tags in the registry.
+        type_aliases = {"id": ["id", "cpf"], "company": ["cnpj"], "cpf": ["cpf"], "cnpj": ["cnpj"]}
+        match_tags = type_aliases.get(selector_type, [selector_type])
+
+        # Free-API-first ordering: free/official before api-key, paid last.
+        def access_rank(entry: Dict[str, Any]) -> int:
+            access = entry.get("access", "").lower()
+            if "tool" in access or "free" in access or "official" in access:
+                return 0
+            if "api" in access:  # api-key (often has a free tier)
+                return 1
+            if "gated" in access:
+                return 2
+            return 3  # paid
+
+        def collect(source_groups: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+            hits = []
+            for category, entries in source_groups.items():
+                for entry in entries:
+                    if any(tag in entry.get("selectors", []) for tag in match_tags):
+                        hits.append({**entry, "category": category})
+            return sorted(hits, key=access_rank)
+
+        global_sources = collect(OSINT_SOURCES["global"])
+        plan = {
+            "selector": selector,
+            "selector_type": selector_type,
+            "country": country,
+            "depth": depth,
+            "matched_sources": {"global": global_sources},
+            "lookup_order": ["validate selector format", "free/official sources first",
+                             "API-key services", "paid breach-intel", "Tor onion (deep/full)"],
+            "pivots": {
+                "email": ["-> breach records -> reused passwords", "-> linked accounts (holehe/epieos)", "-> username -> social"],
+                "phone": ["-> carrier/region", "-> name (truecaller)", "-> linked messaging accounts"],
+                "name": ["-> usernames -> social", "-> public records / legal", "-> email pattern via employer domain"],
+                "id": ["-> official validation", "-> court/transparency records", "-> breach-exposure check"],
+                "username": ["-> cross-platform profiles", "-> email -> breach", "-> real name"],
+                "domain": ["-> subdomains/certs", "-> employee emails (hunter)", "-> exposed services"],
+            }.get(selector_type, ["-> correlate across sources"]),
+            "opsec": [
+                "Passive collection only; do not contact or authenticate as the subject.",
+                "Log source + timestamp per finding (chain-of-custody).",
+                "PII subject to GDPR / LGPD (Lei 13.709) — process only within lawful authorization.",
+            ],
+            "disclaimer": "Authorized investigation / training only. Misuse of PII may be a crime.",
+        }
+        # Free-first shortlist the agent should try before spending on paid APIs.
+        plan["recommended_free"] = [
+            {"name": s["name"], "url": s["url"], "access": s.get("access")}
+            for s in global_sources if access_rank(s) == 0
+        ][:6]
+
+        if country.lower() in ("br", "brazil", "brasil"):
+            plan["matched_sources"]["brazil"] = collect(OSINT_SOURCES["brazil"])
+            plan["brazil_notes"] = [
+                "CPF: use Receita Federal for validation (needs CPF+birthdate+captcha) — not bulk enrichment.",
+                "CNPJ: ReceitaWS / BrasilAPI give official company + sócios data.",
+                "Court records (e-SAJ/PJe) searchable by name/CPF in many tribunals.",
+                "Grey-market CPF sellers are illegal under LGPD and excluded by design.",
+            ]
+
+        if depth in ("deep", "full"):
+            plan["tor_transport"] = {
+                "enabled": True,
+                "socks_proxy": tor_client.socks_proxy,
+                "fetch_endpoint": "/api/osint/tor-fetch",
+                "rule": "Onion-source lookups for this selector route through Tor.",
+            }
+            plan["matched_sources"]["onion"] = collect(OSINT_SOURCES["onion"])
+
+        return plan
+
+    # ----------------------------------------------------------------------
+    # 3. PAYLOAD DEVELOPMENT LAB
+    # ----------------------------------------------------------------------
+    def build_payload_lab(self, payload_class: str = "web", target_context: str = "",
+                          evasion_focus: bool = False) -> Dict[str, Any]:
+        """Teaching-oriented payload-development module. Explains payload anatomy,
+        construction steps, encoding/evasion theory, and verification — so trainees
+        learn WHY a payload works, not just copy strings."""
+        modules = {
+            "web": {
+                "title": "Web Injection Payloads",
+                "families": ["xss", "sqli", "ssti", "command-injection", "xxe", "ssrf"],
+                "anatomy": ["context detection", "delimiter breakout", "logic/payload body", "encoding for sink"],
+                "build_steps": [
+                    "Identify the sink + parsing context (HTML attr, JS, SQL string, template).",
+                    "Craft minimal proof (alert/sleep/canary) before weaponizing.",
+                    "Layer encoding to survive transport (URL, HTML-entity, base64).",
+                    "Confirm out-of-band where reflection is blind (collaborator/DNS).",
+                ],
+                "verification": ["canary callback received", "deterministic time-delay observed", "OOB interaction logged"],
+            },
+            "shellcode": {
+                "title": "Binary / Shellcode Payloads",
+                "families": ["staged", "stageless", "egghunter", "rop-chain"],
+                "anatomy": ["bad-char survey", "decoder stub", "payload body", "return/ret2libc target"],
+                "build_steps": [
+                    "Enumerate bad chars against the target parser.",
+                    "Generate with msfvenom or hand-roll; map gadgets with ropper/ROPgadget.",
+                    "Encode to dodge bad chars; align stack; set return target.",
+                    "Test in matching lab VM under gdb-pwndbg before live attempt.",
+                ],
+                "verification": ["controlled EIP/RIP", "clean shellcode execution in debugger", "no crash on bad-char"],
+            },
+            "implant": {
+                "title": "Implant / Agent Staging (C2 concepts)",
+                "families": ["http-beacon", "dns-beacon", "smb-named-pipe", "reverse-shell"],
+                "anatomy": ["initial stager", "comms channel", "tasking loop", "cleanup"],
+                "build_steps": [
+                    "Pick channel matching the lab's egress rules (HTTP/DNS/SMB).",
+                    "Generate listener in the lab C2 (Sliver/Mythic/Havoc/Metasploit).",
+                    "Build stager; minimize footprint; set sleep/jitter.",
+                    "Validate check-in, tasking, and clean teardown in range only.",
+                ],
+                "verification": ["beacon check-in", "task round-trip", "artifact cleanup confirmed"],
+            },
+        }
+        module = modules.get(payload_class, modules["web"])
+        result = {
+            "payload_class": payload_class,
+            "module": module,
+            "target_context": target_context or "generic lab target",
+            "difficulty": "scales with chosen family",
+            "blue_team_crosswalk": "Every payload built here must be paired with a detection in the malware/defense lab.",
+            "disclaimer": "Lab targets you own/are authorized to test. No production use.",
+        }
+        if evasion_focus:
+            result["evasion_theory"] = {
+                "principle": "Evasion teaches the defender what to detect — pair offense with a signature.",
+                "techniques": [
+                    {"name": "encoding/obfuscation", "defeats": "static string match", "detect_with": "entropy + behavior"},
+                    {"name": "polymorphism", "defeats": "hash/sig", "detect_with": "behavioral/EDR telemetry"},
+                    {"name": "living-off-the-land", "defeats": "binary allowlist", "detect_with": "command-line + parent-child anomaly"},
+                    {"name": "sleep/jitter + domain-fronting", "defeats": "naive netflow", "detect_with": "JA3/JA4 + beacon analysis"},
+                ],
+                "ethics_gate": "Evasion content scoped to authorized labs; each technique ships with its detection.",
+            }
+        return result
+
+    # ----------------------------------------------------------------------
+    # 4. MALWARE LAB — OFFENSE + DEFENSE
+    # ----------------------------------------------------------------------
+    def build_malware_lab(self, sample_family: str = "loader", track: str = "both") -> Dict[str, Any]:
+        """Dual-track malware lab. track = offense | defense | both.
+
+        Offense track teaches malware *structure* for red-team simulation in an
+        isolated detonation range. Defense track is the heavyweight: sandboxing,
+        YARA authoring, behavioral detection, IOC extraction, MITRE mapping."""
+        lab = {
+            "sample_family": sample_family,
+            "track": track,
+            "containment": {
+                "network": "fully air-gapped detonation VLAN; INetSim/FakeNet for fake services",
+                "host": "disposable analysis VM (FlareVM/REMnux) with snapshots",
+                "rule": "Never detonate on a host with internet or production reachability.",
+            },
+            "disclaimer": "Isolated malware detonation range only. Build/detonate nothing outside containment.",
+        }
+
+        if track in ("offense", "both"):
+            lab["offense_track"] = {
+                "goal": "Build a benign lab-simulant of a malware family for red-team + detection-eng practice.",
+                "family_blueprint": {
+                    "loader": ["stager fetch", "in-memory map", "hand-off to next stage"],
+                    "dropper": ["embedded resource", "drop to disk", "persistence", "execute"],
+                    "ransomware-sim": ["enumerate test files", "REVERSIBLE marker-encrypt of lab data only", "drop note"],
+                    "infostealer-sim": ["locate decoy creds", "stage to lab collector", "exfil over lab channel"],
+                }.get(sample_family, ["init", "payload", "persistence", "cleanup"]),
+                "construction_notes": [
+                    "Use canary/marker behavior, not destructive logic (e.g., copy not crypt; touch not destroy).",
+                    "Emit deliberate telemetry so the defense track has something to catch.",
+                    "Tag the sample (hash + build id) for the range's known-sample registry.",
+                ],
+                "persistence_concepts": ["run-key (lab)", "scheduled task (lab)", "service (lab)", "cron (lab)"],
+                "safe_by_design": "Simulants must be reversible and non-propagating. No worm/self-spread logic.",
+            }
+
+        if track in ("defense", "both"):
+            lab["defense_track"] = {
+                "goal": "Detect, analyze, and report the sample — the real skill for blue-team dojos.",
+                "static_analysis": {
+                    "tools": ["pe-bear/exeinfo", "strings + floss", "capa", "yara"],
+                    "outputs": ["imports/exports", "embedded resources", "capability map (capa)", "candidate IOCs"],
+                },
+                "dynamic_analysis": {
+                    "tools": ["procmon", "noriben", "wireshark on FakeNet", "cuckoo/CAPE sandbox"],
+                    "observe": ["file writes", "registry/persistence", "process tree", "network beacons"],
+                },
+                "yara_authoring": {
+                    "method": "Generalize from static strings/imports -> resilient rule (avoid overfit hashes).",
+                    "template": (
+                        "rule LAB_{family}_simulant {{\n"
+                        "  meta:\n    author = \"dojo\"\n    description = \"detects lab {family} simulant\"\n"
+                        "    tlp = \"clear\"\n"
+                        "  strings:\n    $s1 = \"<unique-behavioral-string>\"\n    $s2 = {{ 6A 40 68 00 30 00 00 }}\n"
+                        "  condition:\n    uint16(0) == 0x5A4D and any of them\n}}"
+                    ).format(family=sample_family),
+                    "quality_gate": ["no false positives on goodware corpus", "survives recompile", "documents rationale"],
+                },
+                "behavioral_detection": {
+                    "sigma_rules": "Author Sigma for process-creation + network events; convert to SIEM query.",
+                    "edr_telemetry": ["parent-child anomalies", "suspicious command-lines", "unsigned-in-temp execution"],
+                },
+                "ioc_extraction": {
+                    "types": ["hashes (sha256)", "C2 domains/IPs", "mutex names", "file paths", "registry keys"],
+                    "format": "export STIX 2.1 bundle + plain IOC list for range threat-intel feed",
+                },
+                "mitre_attack_mapping": {
+                    "method": "Map each observed behavior to ATT&CK technique IDs.",
+                    "example": {"persistence": "T1547.001", "defense-evasion": "T1027", "c2": "T1071.001",
+                                "exfiltration": "T1041", "impact-ransomware-sim": "T1486"},
+                },
+                "incident_report": {
+                    "sections": ["executive summary", "timeline", "TTPs (ATT&CK)", "IOCs", "detections authored", "remediation"],
+                    "war_room_value": "Scored deliverable in red-vs-blue events.",
+                },
+            }
+
+        if track == "both":
+            lab["purple_team_loop"] = {
+                "flow": "offense builds simulant -> defense detects -> gaps found -> offense evades -> defense improves",
+                "scoring": "Each detection that catches the next offensive iteration = blue points; each evasion = red points.",
+                "outcome": "Trainees leave with working YARA/Sigma rules mapped to real attacker behavior.",
+            }
+        return lab
+
+
+# Global cyber range / dojo / war room manager
+cyber_range_manager = CyberRangeLabManager()
+
+
+@app.route("/api/labs/catalog", methods=["GET"])
+def labs_catalog():
+    """List available lab scenarios, difficulty tiers, and training tracks."""
+    try:
+        return jsonify({
+            "success": True,
+            "scenarios": cyber_range_manager.lab_scenarios,
+            "difficulty_tiers": cyber_range_manager.DIFFICULTY_TIERS,
+            "tracks": {
+                "pentest_lab": "/api/labs/pentest-lab",
+                "osint_investigation": "/api/labs/osint-investigation",
+                "payload_lab": "/api/labs/payload-lab",
+                "malware_lab": "/api/labs/malware-lab",
+            },
+            "timestamp": datetime.now().isoformat(),
+        })
+    except Exception as e:
+        logger.error(f"💥 Error listing lab catalog: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+@app.route("/api/labs/pentest-lab", methods=["POST"])
+def build_pentest_lab_endpoint():
+    """Build a detailed pentest-lab / dojo blueprint for a given scenario."""
+    try:
+        data = request.get_json() or {}
+        scenario = data.get("scenario", "web-app-gauntlet")
+        tier = data.get("tier", "")
+        team_mode = data.get("team_mode", "individual")
+
+        logger.info(f"🥋 Building pentest lab | scenario={scenario} tier={tier or 'default'} mode={team_mode}")
+        blueprint = cyber_range_manager.build_pentest_lab(scenario, tier, team_mode)
+        return jsonify({"success": True, "blueprint": blueprint, "timestamp": datetime.now().isoformat()})
+    except Exception as e:
+        logger.error(f"💥 Error building pentest lab: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+@app.route("/api/labs/osint-investigation", methods=["POST"])
+def build_osint_investigation_endpoint():
+    """Build a layered OSINT plan (surface | deep | full incl. dark-web)."""
+    try:
+        data = request.get_json() or {}
+        if not data.get("target"):
+            return jsonify({"error": "target is required"}), 400
+        target = data["target"]
+        depth = data.get("depth", "surface")
+        investigation_type = data.get("investigation_type", "organization")
+
+        logger.info(f"🔍 Building OSINT investigation | target={target} depth={depth}")
+        plan = cyber_range_manager.build_osint_investigation(target, depth, investigation_type)
+        return jsonify({"success": True, "investigation": plan, "timestamp": datetime.now().isoformat()})
+    except Exception as e:
+        logger.error(f"💥 Error building OSINT investigation: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+@app.route("/api/labs/payload-lab", methods=["POST"])
+def build_payload_lab_endpoint():
+    """Build a teaching-oriented payload-development module."""
+    try:
+        data = request.get_json() or {}
+        payload_class = data.get("payload_class", "web")
+        target_context = data.get("target_context", "")
+        evasion_focus = bool(data.get("evasion_focus", False))
+
+        logger.info(f"🧪 Building payload lab | class={payload_class} evasion={evasion_focus}")
+        module = cyber_range_manager.build_payload_lab(payload_class, target_context, evasion_focus)
+        return jsonify({"success": True, "payload_lab": module, "timestamp": datetime.now().isoformat()})
+    except Exception as e:
+        logger.error(f"💥 Error building payload lab: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+@app.route("/api/wordlists/environment", methods=["GET"])
+def wordlists_environment():
+    """Detect host OS / distro and locate native SecLists install."""
+    try:
+        env = wordlist_manager.detect_environment()
+        wordlist_manager.env = env  # refresh
+        return jsonify({"success": True, "environment": env, "install_hint": wordlist_manager._install_hint(),
+                        "timestamp": datetime.now().isoformat()})
+    except Exception as e:
+        logger.error(f"💥 Error detecting wordlist environment: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+@app.route("/api/wordlists/registry", methods=["GET"])
+def wordlists_registry():
+    """List known wordlists (name, category, use, source URL)."""
+    try:
+        return jsonify({"success": True, "count": len(WORDLIST_REGISTRY), "registry": WORDLIST_REGISTRY,
+                        "timestamp": datetime.now().isoformat()})
+    except Exception as e:
+        logger.error(f"💥 Error listing wordlist registry: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+@app.route("/api/wordlists/setup", methods=["POST"])
+def wordlists_setup():
+    """Resolve (and optionally download) wordlists for the detected OS.
+
+    Body: {names:[...], download:bool, allow_large:bool}
+    Omit names to process the whole registry."""
+    try:
+        data = request.get_json() or {}
+        names = data.get("names")
+        download = bool(data.get("download", False))
+        allow_large = bool(data.get("allow_large", False))
+
+        logger.info(f"📚 Wordlist setup | download={download} allow_large={allow_large} names={names or 'ALL'}")
+        result = wordlist_manager.setup(names=names, download=download, allow_large=allow_large)
+        return jsonify({"success": True, **result, "timestamp": datetime.now().isoformat()})
+    except Exception as e:
+        logger.error(f"💥 Error in wordlist setup: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+@app.route("/api/wordlists/cewl", methods=["POST"])
+def wordlists_cewl():
+    """Build a CeWL command to generate a target-specific wordlist by crawling."""
+    try:
+        data = request.get_json() or {}
+        url = data.get("url", "")
+        if not url:
+            return jsonify({"error": "url is required"}), 400
+        cmd = wordlist_manager.cewl_command(
+            url, depth=int(data.get("depth", 2)), min_length=int(data.get("min_length", 5)),
+            output=data.get("output", ""), extra=data.get("extra", ""),
+        )
+        return jsonify({"success": True, "cewl": cmd, "timestamp": datetime.now().isoformat()})
+    except Exception as e:
+        logger.error(f"💥 Error building CeWL command: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+@app.route("/api/osint/sources", methods=["GET"])
+def osint_sources():
+    """Return the default OSINT source registry. Optional filters:
+    ?region=global|onion|brazil  &  ?selector=email|phone|name|id|cpf|cnpj|username|domain"""
+    try:
+        region = request.args.get("region", "")
+        selector = request.args.get("selector", "").lower()
+
+        registry = OSINT_SOURCES
+        if region in OSINT_SOURCES:
+            registry = {region: OSINT_SOURCES[region]}
+
+        if selector:
+            filtered = {}
+            for reg, groups in registry.items():
+                for category, entries in groups.items():
+                    matches = [e for e in entries if selector in e.get("selectors", [])]
+                    if matches:
+                        filtered.setdefault(reg, {})[category] = matches
+            registry = filtered
+
+        total = sum(len(entries) for groups in registry.values() for entries in groups.values())
+        return jsonify({"success": True, "count": total, "sources": registry,
+                        "timestamp": datetime.now().isoformat()})
+    except Exception as e:
+        logger.error(f"💥 Error listing OSINT sources: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+@app.route("/api/osint/selector-search", methods=["POST"])
+def osint_selector_search():
+    """Build a prioritized lookup plan for a selector (email/phone/name/id),
+    global or Brazil-specific, with Tor onion sources for deep/full depth."""
+    try:
+        data = request.get_json() or {}
+        selector = data.get("selector", "")
+        if not selector:
+            return jsonify({"error": "selector is required"}), 400
+        selector_type = data.get("selector_type", "email")
+        country = data.get("country", "global")
+        depth = data.get("depth", "surface")
+
+        logger.info(f"🔎 Selector investigation | type={selector_type} country={country} depth={depth}")
+        plan = cyber_range_manager.build_selector_investigation(selector, selector_type, country, depth)
+        return jsonify({"success": True, "investigation": plan, "timestamp": datetime.now().isoformat()})
+    except Exception as e:
+        logger.error(f"💥 Error building selector investigation: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+@app.route("/api/osint/tor-status", methods=["GET"])
+def osint_tor_status():
+    """Verify Tor connectivity for deep/dark-web OSINT (exit IP + is_tor)."""
+    try:
+        logger.info("🧅 Checking Tor circuit status")
+        status = tor_client.status()
+        return jsonify({"success": status.get("connected", False), "tor": status,
+                        "timestamp": datetime.now().isoformat()})
+    except Exception as e:
+        logger.error(f"💥 Error checking Tor status: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+@app.route("/api/osint/tor-fetch", methods=["POST"])
+def osint_tor_fetch():
+    """Fetch a clearnet or .onion URL over Tor (read-only OSINT collection)."""
+    try:
+        data = request.get_json() or {}
+        url = data.get("url", "")
+        if not url:
+            return jsonify({"error": "url is required"}), 400
+        method = data.get("method", "GET")
+        timeout = int(data.get("timeout", 60))
+        extra_headers = data.get("headers")
+
+        logger.info(f"🧅 Tor fetch | {url}")
+        result = tor_client.fetch(url, method=method, timeout=timeout, extra_headers=extra_headers)
+        return jsonify({"success": result.get("success", False), "result": result,
+                        "timestamp": datetime.now().isoformat()})
+    except Exception as e:
+        logger.error(f"💥 Error in Tor fetch: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+@app.route("/api/osint/tor-new-identity", methods=["POST"])
+def osint_tor_new_identity():
+    """Request a fresh Tor circuit (new exit node) via the control port."""
+    try:
+        logger.info("🧅 Requesting new Tor identity")
+        result = tor_client.new_identity()
+        return jsonify({"success": result.get("success", False), "result": result,
+                        "timestamp": datetime.now().isoformat()})
+    except Exception as e:
+        logger.error(f"💥 Error requesting new Tor identity: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
+
+@app.route("/api/labs/malware-lab", methods=["POST"])
+def build_malware_lab_endpoint():
+    """Build a dual-track (offense+defense) malware analysis lab."""
+    try:
+        data = request.get_json() or {}
+        sample_family = data.get("sample_family", "loader")
+        track = data.get("track", "both")
+
+        logger.info(f"🦠 Building malware lab | family={sample_family} track={track}")
+        lab = cyber_range_manager.build_malware_lab(sample_family, track)
+        return jsonify({"success": True, "malware_lab": lab, "timestamp": datetime.now().isoformat()})
+    except Exception as e:
+        logger.error(f"💥 Error building malware lab: {str(e)}")
+        return jsonify({"error": f"Server error: {str(e)}"}), 500
+
 
 # Create the banner after all classes are defined
 BANNER = ModernVisualEngine.create_banner()

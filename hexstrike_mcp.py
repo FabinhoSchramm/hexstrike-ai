@@ -166,7 +166,8 @@ class HexStrikeClient:
                 logger.info(f"🔗 Attempting to connect to HexStrike AI API at {server_url} (attempt {i+1}/{MAX_RETRIES})")
                 # First try a direct connection test before using the health endpoint
                 try:
-                    test_response = self.session.get(f"{self.server_url}/health", timeout=5)
+                    # Cold /health does a ~120-tool scan that can exceed 5s; allow headroom.
+                    test_response = self.session.get(f"{self.server_url}/health", timeout=30)
                     test_response.raise_for_status()
                     health_check = test_response.json()
                     connected = True
@@ -5148,6 +5149,251 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
             "workflow": workflow,
             "timestamp": datetime.now().isoformat()
         }
+
+    # ============================================================================
+    # CYBER RANGE / DOJO / WAR ROOM TRAINING LABS + TOR DEEP-WEB OSINT
+    # ============================================================================
+
+    @mcp.tool()
+    def labs_catalog() -> Dict[str, Any]:
+        """
+        List available cyber-range training labs: scenarios, difficulty tiers, and tracks.
+
+        Returns:
+            Catalog of pentest-lab scenarios, belt tiers, and lab track endpoints
+        """
+        logger.info("🥋 Fetching lab catalog")
+        return hexstrike_client.safe_get("api/labs/catalog")
+
+    @mcp.tool()
+    def lab_build_pentest(scenario: str = "web-app-gauntlet", tier: str = "",
+                          team_mode: str = "individual") -> Dict[str, Any]:
+        """
+        Build a detailed pentest-lab / dojo blueprint for authorized training ranges.
+
+        Args:
+            scenario: web-app-gauntlet | ad-deathmatch | cloud-breakout | binary-pit | blue-team-siege
+            tier: white-belt | blue-belt | purple-belt | black-belt (blank = scenario default)
+            team_mode: individual | red-vs-blue | war-room (adds king-of-the-hill scoring)
+
+        Returns:
+            Lab blueprint: network topology, vulnerable target build specs, graduated
+            phases with points, hints, instructor notes, and war-room scoring
+        """
+        data = {"scenario": scenario, "tier": tier, "team_mode": team_mode}
+        logger.info(f"🥋 Building pentest lab | {scenario} ({team_mode})")
+        return hexstrike_client.safe_post("api/labs/pentest-lab", data)
+
+    @mcp.tool()
+    def lab_osint_investigation(target: str, depth: str = "surface",
+                                investigation_type: str = "organization") -> Dict[str, Any]:
+        """
+        Build a layered OSINT investigation plan. Deep/full depths route through Tor.
+
+        Args:
+            target: Target domain / org / username / selector
+            depth: surface | deep | full
+                   surface = clearnet (DNS, certs, search, social, breach-exposure)
+                   deep    = + paste/leak monitoring, credential intel, doc intel (via Tor)
+                   full    = + dark-web (onion discovery, ransomware DLS, actor mentions, IOC) via Tor
+            investigation_type: organization | person | infrastructure
+
+        Returns:
+            Multi-layer OSINT plan with OPSEC guidance and Tor transport config for deep/dark layers
+        """
+        data = {"target": target, "depth": depth, "investigation_type": investigation_type}
+        logger.info(f"🔍 OSINT investigation | {target} (depth={depth})")
+        return hexstrike_client.safe_post("api/labs/osint-investigation", data)
+
+    @mcp.tool()
+    def lab_payload_module(payload_class: str = "web", target_context: str = "",
+                           evasion_focus: bool = False) -> Dict[str, Any]:
+        """
+        Build a teaching-oriented payload-development module (anatomy, build steps, verification).
+
+        Args:
+            payload_class: web | shellcode | implant
+            target_context: optional target/tech description for tailoring
+            evasion_focus: if true, adds evasion theory paired with detection crosswalk
+
+        Returns:
+            Payload-dev curriculum: anatomy, construction steps, verification, blue-team crosswalk
+        """
+        data = {"payload_class": payload_class, "target_context": target_context,
+                "evasion_focus": evasion_focus}
+        logger.info(f"🧪 Payload lab | class={payload_class} evasion={evasion_focus}")
+        return hexstrike_client.safe_post("api/labs/payload-lab", data)
+
+    @mcp.tool()
+    def lab_malware_dualtrack(sample_family: str = "loader", track: str = "both") -> Dict[str, Any]:
+        """
+        Build a dual-track malware lab (offense simulant + defense detection) for isolated ranges.
+
+        Args:
+            sample_family: loader | dropper | ransomware-sim | infostealer-sim
+            track: offense | defense | both
+                   offense = benign reversible simulant blueprint (safe-by-design)
+                   defense = static/dynamic analysis, YARA + Sigma authoring, IOC->STIX, ATT&CK mapping
+                   both    = purple-team build->detect->evade->improve loop with scoring
+
+        Returns:
+            Malware lab plan with air-gapped containment, detection artifacts, and IR reporting
+        """
+        data = {"sample_family": sample_family, "track": track}
+        logger.info(f"🦠 Malware lab | {sample_family} ({track})")
+        return hexstrike_client.safe_post("api/labs/malware-lab", data)
+
+    @mcp.tool()
+    def osint_tor_status() -> Dict[str, Any]:
+        """
+        Verify Tor connectivity for deep/dark-web OSINT (reports exit IP and is_tor).
+
+        Returns:
+            Tor circuit status: connected, is_tor, exit_ip, socks_proxy
+        """
+        logger.info("🧅 Checking Tor status")
+        return hexstrike_client.safe_get("api/osint/tor-status")
+
+    @mcp.tool()
+    def osint_tor_fetch(url: str, method: str = "GET", timeout: int = 60,
+                        headers: dict = {}) -> Dict[str, Any]:
+        """
+        Fetch a clearnet or .onion URL over the Tor network (read-only OSINT collection).
+
+        Use for authorized deep/dark-web OSINT: paste sites, leak indexes, onion search,
+        ransomware leak sites. socks5h ensures .onion resolves via Tor (no DNS leak).
+
+        Args:
+            url: Target URL (http/https or .onion)
+            method: HTTP method (default GET)
+            timeout: Request timeout seconds (default 60; onion services can be slow)
+            headers: Optional extra request headers
+
+        Returns:
+            Fetched content (capped), status code, final URL, routed_through_tor flag
+        """
+        data = {"url": url, "method": method, "timeout": timeout, "headers": headers}
+        logger.info(f"🧅 Tor fetch | {url}")
+        return hexstrike_client.safe_post("api/osint/tor-fetch", data)
+
+    @mcp.tool()
+    def osint_tor_new_identity() -> Dict[str, Any]:
+        """
+        Request a fresh Tor circuit (new exit node) between OSINT collection runs.
+
+        Returns:
+            Result of NEWNYM signal via the Tor control port
+        """
+        logger.info("🧅 Requesting new Tor identity")
+        return hexstrike_client.safe_post("api/osint/tor-new-identity", {})
+
+    @mcp.tool()
+    def osint_sources(region: str = "", selector: str = "") -> Dict[str, Any]:
+        """
+        List the default OSINT source registry (global + onion + Brazil).
+
+        Args:
+            region: optional filter — global | onion | brazil (blank = all)
+            selector: optional filter — email | phone | name | id | cpf | cnpj | username | domain
+
+        Returns:
+            Curated source registry: name, url/onion, accepted selectors, access tier, notes
+        """
+        params = {}
+        if region:
+            params["region"] = region
+        if selector:
+            params["selector"] = selector
+        logger.info(f"📇 OSINT sources | region={region or 'all'} selector={selector or 'all'}")
+        return hexstrike_client.safe_get("api/osint/sources", params)
+
+    @mcp.tool()
+    def osint_selector_search(selector: str, selector_type: str = "email",
+                              country: str = "global", depth: str = "surface") -> Dict[str, Any]:
+        """
+        Build a prioritized lookup plan to investigate a selector across OSINT sources.
+
+        Finds where a given email / phone / name / national-ID is exposed, ordered
+        free->official->paid->onion. country='br' adds Brazil sources (CPF/CNPJ/court).
+        deep/full depth adds Tor-routed onion sources. Authorized investigation only.
+
+        Args:
+            selector: the value to investigate (email address, phone, full name, CPF, etc.)
+            selector_type: email | phone | name | id | username | domain | cpf | cnpj
+            country: global | br  (br adds Brazil-specific registries)
+            depth: surface | deep | full  (deep/full route onion lookups through Tor)
+
+        Returns:
+            Investigation plan: matched sources, lookup order, pivots, OPSEC, LGPD/GDPR notes
+        """
+        data = {"selector": selector, "selector_type": selector_type,
+                "country": country, "depth": depth}
+        logger.info(f"🔎 Selector search | {selector_type}/{country}/{depth}")
+        return hexstrike_client.safe_post("api/osint/selector-search", data)
+
+    @mcp.tool()
+    def wordlists_environment() -> Dict[str, Any]:
+        """
+        Detect the host OS / distro (Kali, other Linux, Windows) and locate SecLists.
+
+        Returns:
+            Environment info (os, is_kali, seclists_base, wordlist_base) + install hint
+        """
+        logger.info("📚 Detecting wordlist environment")
+        return hexstrike_client.safe_get("api/wordlists/environment")
+
+    @mcp.tool()
+    def wordlists_registry() -> Dict[str, Any]:
+        """
+        List the known wordlists (raft, rockyou, subdomains, n0kovo, api-endpoints,
+        LFI-Jhaddix, crackstation, onelistforall) with category, use, and source URL.
+
+        Returns:
+            Wordlist registry
+        """
+        logger.info("📚 Listing wordlist registry")
+        return hexstrike_client.safe_get("api/wordlists/registry")
+
+    @mcp.tool()
+    def wordlists_setup(names: list = [], download: bool = False,
+                        allow_large: bool = False) -> Dict[str, Any]:
+        """
+        Resolve (and optionally download) wordlists for the detected OS. Free GitHub
+        sources used first. Kali resolves native /usr/share/seclists paths.
+
+        Args:
+            names: subset of wordlist keys (empty = whole registry). e.g.
+                   ["raft-large-directories","rockyou","subdomains-top1million-110000",
+                    "n0kovo_subdomains","api-endpoints","LFI-Jhaddix","crackstation","onelistforall"]
+            download: if true, fetch missing lists from source
+            allow_large: required to download big lists (rockyou ~133MB, crackstation ~684MB)
+
+        Returns:
+            Per-wordlist resolved paths or download results + environment + install hint
+        """
+        data = {"names": names, "download": download, "allow_large": allow_large}
+        logger.info(f"📚 Wordlist setup | download={download} large={allow_large} names={names or 'ALL'}")
+        return hexstrike_client.safe_post("api/wordlists/setup", data)
+
+    @mcp.tool()
+    def wordlists_cewl(url: str, depth: int = 2, min_length: int = 5,
+                       output: str = "", extra: str = "") -> Dict[str, Any]:
+        """
+        Build a CeWL command to generate a target-specific wordlist by crawling a URL.
+
+        Args:
+            url: target URL to crawl
+            depth: crawl depth (default 2)
+            min_length: minimum word length (default 5)
+            output: output file path (blank = wordlist dir / cewl_custom.txt)
+            extra: extra CeWL flags (e.g. "--with-numbers -e")
+
+        Returns:
+            Ready-to-run CeWL command + install hint
+        """
+        data = {"url": url, "depth": depth, "min_length": min_length, "output": output, "extra": extra}
+        logger.info(f"📚 CeWL command for {url}")
+        return hexstrike_client.safe_post("api/wordlists/cewl", data)
 
     # ============================================================================
     # ENHANCED HTTP TESTING FRAMEWORK & BROWSER AGENT (BURP SUITE ALTERNATIVE)

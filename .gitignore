@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logs / runtime artifacts
+*.log
+server_run.log
+server_err.log
+
+# Stray literal-variable dir (created when ${HOME} wasn't expanded)
+${HOME}/
